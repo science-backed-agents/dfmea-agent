@@ -12,28 +12,28 @@ on:
         required: true
         type: string
       package_name:
-        description: "Package name"
+        description: "Package name (e.g. dfmea-agent)"
         required: true
         type: string
       package_version:
-        description: "Package version"
+        description: "Package version (e.g. 1.0.0)"
         required: true
         type: string
       entrypoint:
-        description: "Python entrypoint (e.g. src.main:main)"
+        description: "Python entrypoint module path (e.g. src.main:main)"
         required: true
         type: string
       dependencies:
-        description: "JSON array of Python dependencies"
+        description: 'JSON array of Python dependencies (e.g. ["anthropic>=0.40.0"])'
         required: false
         default: "[]"
         type: string
       callback_url:
-        description: "Platform webhook URL"
+        description: "Platform webhook URL to POST results to"
         required: true
         type: string
       callback_token:
-        description: "HMAC token for callback auth"
+        description: "HMAC token for authenticating the callback"
         required: true
         type: string
 
@@ -43,80 +43,172 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout source
+      - name: Checkout source repository at pinned commit
         uses: actions/checkout@v4
         with:
           repository: ${{ inputs.source_repo }}
           ref: ${{ inputs.commit_sha }}
           path: source
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install build tools
         run: pip install build setuptools>=61.0
 
-      - name: Generate pyproject.toml and build
+      - name: Generate pyproject.toml
         run: |
           cd source
-          python3 -c "
-          import json
-          name = '${{ inputs.package_name }}'
-          version = '${{ inputs.package_version }}'
-          entrypoint = '${{ inputs.entrypoint }}'
-          deps = json.loads('${{ inputs.dependencies }}')
-          deps_str = chr(10).join(f'    \\"{d}\\",' for d in deps)
-          if ':' not in entrypoint:
-              module = entrypoint.replace('/', '.').replace('.py', '')
-              entrypoint = f'{module}:main'
-          toml = f'''[build-system]
-          requires = [\\"setuptools>=61.0\\"]
-          build-backend = \\"setuptools.build_meta\\"
+          cat > pyproject.toml << 'PYPROJECT_EOF'
+          [build-system]
+          requires = ["setuptools>=61.0"]
+          build-backend = "setuptools.build_meta"
+          PYPROJECT_EOF
 
+          # Use Python to safely generate the project section from inputs
+          python3 << 'PYTHON_EOF'
+          import json, sys
+
+          name = "${{ inputs.package_name }}"
+          version = "${{ inputs.package_version }}"
+          entrypoint = "${{ inputs.entrypoint }}"
+          deps_json = '${{ inputs.dependencies }}'
+
+          try:
+              deps = json.loads(deps_json)
+          except json.JSONDecodeError:
+              deps = []
+
+          deps_str = ",\n".join(f'    "{d}"' for d in deps)
+
+          # Determine script entry point
+          # entrypoint format: "src.main:main" or "src/main.py"
+          if ":" in entrypoint:
+              script_entry = entrypoint
+          else:
+              # Convert file path to module path: src/main.py -> src.main:main
+              module = entrypoint.replace("/", ".").replace(".py", "")
+              script_entry = f"{module}:main"
+
+          toml = f"""
           [project]
-          name = \\"{name}\\"
-          version = \\"{version}\\"
-          description = \\"{name} - science-backed-agents platform\\"
-          requires-python = \\">=3.10\\"
+          name = "{name}"
+          version = "{version}"
+          description = "{name} - science-backed-agents platform"
+          requires-python = ">=3.10"
           dependencies = [
           {deps_str}
           ]
 
           [project.scripts]
-          {name} = \\"{entrypoint}\\"
+          {name} = "{script_entry}"
 
           [tool.setuptools.packages.find]
-          where = [\\".\\"]
-          '''
-          with open('pyproject.toml', 'w') as f: f.write(toml)
-          "
-          python -m build
+          where = ["."]
+          """
 
-      - name: Compute hash and create release
+          with open("pyproject.toml", "a") as f:
+              f.write(toml)
+
+          print(f"Generated pyproject.toml for {name}@{version}")
+          print(f"Script entry: {name} = {script_entry}")
+          PYTHON_EOF
+
+          echo "--- Generated pyproject.toml ---"
+          cat pyproject.toml
+
+      - name: Build wheel and sdist
+        run: |
+          cd source
+          python -m build
+          echo "--- Built artifacts ---"
+          ls -la dist/
+
+      - name: Compute SHA256 hashes
         id: hashes
         run: |
           cd source/dist
-          WHL=$(ls *.whl | head -1)
+          WHL=$(ls *.whl 2>/dev/null | head -1)
+          SDIST=$(ls *.tar.gz 2>/dev/null | head -1)
+
+          if [ -z "$WHL" ]; then
+            echo "ERROR: No wheel file found"
+            exit 1
+          fi
+
           WHL_HASH=$(sha256sum "$WHL" | cut -d' ' -f1)
           echo "whl_file=$WHL" >> "$GITHUB_OUTPUT"
           echo "whl_hash=$WHL_HASH" >> "$GITHUB_OUTPUT"
 
+          if [ -n "$SDIST" ]; then
+            SDIST_HASH=$(sha256sum "$SDIST" | cut -d' ' -f1)
+            echo "sdist_file=$SDIST" >> "$GITHUB_OUTPUT"
+            echo "sdist_hash=$SDIST_HASH" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Wheel: $WHL (sha256:$WHL_HASH)"
+
       - name: Create GitHub Release
+        id: release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ inputs.package_version }}
           name: "${{ inputs.package_name }} v${{ inputs.package_version }}"
-          files: source/dist/*
+          body: |
+            ## ${{ inputs.package_name }} v${{ inputs.package_version }}
+
+            Built from [${{ inputs.source_repo }}@${{ inputs.commit_sha }}](https://github.com/${{ inputs.source_repo }}/tree/${{ inputs.commit_sha }})
+
+            ### Install
+            ```bash
+            pip install '${{ inputs.package_name }} @ <wheel_url>'
+            ```
+
+            ### SHA256
+            - Wheel: `${{ steps.hashes.outputs.whl_hash }}`
+          files: |
+            source/dist/${{ steps.hashes.outputs.whl_file }}
+            source/dist/${{ steps.hashes.outputs.sdist_file }}
+
+      - name: Extract release asset URL
+        id: asset_url
+        run: |
+          # The release asset URL follows a predictable pattern
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/v${{ inputs.package_version }}/${{ steps.hashes.outputs.whl_file }}"
+          echo "release_url=$RELEASE_URL" >> "$GITHUB_OUTPUT"
+          echo "Release URL: $RELEASE_URL"
 
       - name: Callback to platform
-        if: always()
+        if: inputs.callback_url != ''
         run: |
-          STATUS="success"
-          if [ "${{ job.status }}" != "success" ]; then STATUS="failed"; fi
-          RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/v${{ inputs.package_version }}/${{ steps.hashes.outputs.whl_file }}"
+          PAYLOAD=$(cat << 'CALLBACK_EOF'
+          {
+            "package_name": "${{ inputs.package_name }}",
+            "package_version": "${{ inputs.package_version }}",
+            "package_url": "${{ steps.asset_url.outputs.release_url }}",
+            "package_hash": "${{ steps.hashes.outputs.whl_hash }}",
+            "source_repo": "${{ inputs.source_repo }}",
+            "commit_sha": "${{ inputs.commit_sha }}",
+            "status": "success"
+          }
+          CALLBACK_EOF
+
+          # Replace literal GitHub expressions that were already substituted
           curl -X POST "${{ inputs.callback_url }}" \
             -H "Content-Type: application/json" \
             -H "X-SBA-Token: ${{ inputs.callback_token }}" \
-            -d "{\"package_name\":\"${{ inputs.package_name }}\",\"package_version\":\"${{ inputs.package_version }}\",\"package_url\":\"$RELEASE_URL\",\"package_hash\":\"${{ steps.hashes.outputs.whl_hash }}\",\"status\":\"$STATUS\"}" \
+            -d "$PAYLOAD" \
+            --fail --silent --show-error \
+            --max-time 30
+
+      - name: Callback on failure
+        if: failure() && inputs.callback_url != ''
+        run: |
+          curl -X POST "${{ inputs.callback_url }}" \
+            -H "Content-Type: application/json" \
+            -H "X-SBA-Token: ${{ inputs.callback_token }}" \
+            -d '{"package_name":"${{ inputs.package_name }}","package_version":"${{ inputs.package_version }}","status":"failed","error":"Build or release failed — check Actions logs"}' \
+            --fail --silent --show-error \
             --max-time 30 || true
