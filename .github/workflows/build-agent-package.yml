@@ -1,1 +1,122 @@
-name: test
+name: Build Agent Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "Source repository (owner/repo)"
+        required: true
+        type: string
+      commit_sha:
+        description: "Pinned commit SHA"
+        required: true
+        type: string
+      package_name:
+        description: "Package name"
+        required: true
+        type: string
+      package_version:
+        description: "Package version"
+        required: true
+        type: string
+      entrypoint:
+        description: "Python entrypoint (e.g. src.main:main)"
+        required: true
+        type: string
+      dependencies:
+        description: "JSON array of Python dependencies"
+        required: false
+        default: "[]"
+        type: string
+      callback_url:
+        description: "Platform webhook URL"
+        required: true
+        type: string
+      callback_token:
+        description: "HMAC token for callback auth"
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.commit_sha }}
+          path: source
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tools
+        run: pip install build setuptools>=61.0
+
+      - name: Generate pyproject.toml and build
+        run: |
+          cd source
+          python3 -c "
+          import json
+          name = '${{ inputs.package_name }}'
+          version = '${{ inputs.package_version }}'
+          entrypoint = '${{ inputs.entrypoint }}'
+          deps = json.loads('${{ inputs.dependencies }}')
+          deps_str = chr(10).join(f'    \\"{d}\\",' for d in deps)
+          if ':' not in entrypoint:
+              module = entrypoint.replace('/', '.').replace('.py', '')
+              entrypoint = f'{module}:main'
+          toml = f'''[build-system]
+          requires = [\\"setuptools>=61.0\\"]
+          build-backend = \\"setuptools.build_meta\\"
+
+          [project]
+          name = \\"{name}\\"
+          version = \\"{version}\\"
+          description = \\"{name} - science-backed-agents platform\\"
+          requires-python = \\">=3.10\\"
+          dependencies = [
+          {deps_str}
+          ]
+
+          [project.scripts]
+          {name} = \\"{entrypoint}\\"
+
+          [tool.setuptools.packages.find]
+          where = [\\".\\"]
+          '''
+          with open('pyproject.toml', 'w') as f: f.write(toml)
+          "
+          python -m build
+
+      - name: Compute hash and create release
+        id: hashes
+        run: |
+          cd source/dist
+          WHL=$(ls *.whl | head -1)
+          WHL_HASH=$(sha256sum "$WHL" | cut -d' ' -f1)
+          echo "whl_file=$WHL" >> "$GITHUB_OUTPUT"
+          echo "whl_hash=$WHL_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.package_version }}
+          name: "${{ inputs.package_name }} v${{ inputs.package_version }}"
+          files: source/dist/*
+
+      - name: Callback to platform
+        if: always()
+        run: |
+          STATUS="success"
+          if [ "${{ job.status }}" != "success" ]; then STATUS="failed"; fi
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/v${{ inputs.package_version }}/${{ steps.hashes.outputs.whl_file }}"
+          curl -X POST "${{ inputs.callback_url }}" \
+            -H "Content-Type: application/json" \
+            -H "X-SBA-Token: ${{ inputs.callback_token }}" \
+            -d "{\"package_name\":\"${{ inputs.package_name }}\",\"package_version\":\"${{ inputs.package_version }}\",\"package_url\":\"$RELEASE_URL\",\"package_hash\":\"${{ steps.hashes.outputs.whl_hash }}\",\"status\":\"$STATUS\"}" \
+            --max-time 30 || true
