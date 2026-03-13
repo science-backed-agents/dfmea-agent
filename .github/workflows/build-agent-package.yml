@@ -96,7 +96,7 @@ jobs:
           [project]
           name = "{name}"
           version = "{version}"
-          description = "{name} - science-backed-agents platform"
+          description = "{name} - cited-agents platform"
           requires-python = ">=3.10"
           dependencies = [
           {deps_str}
@@ -185,6 +185,7 @@ jobs:
         run: |
           PAYLOAD=$(cat << 'CALLBACK_EOF'
           {
+            "stage": "build",
             "package_name": "${{ inputs.package_name }}",
             "package_version": "${{ inputs.package_version }}",
             "package_url": "${{ steps.asset_url.outputs.release_url }}",
@@ -195,7 +196,6 @@ jobs:
           }
           CALLBACK_EOF
 
-          # Replace literal GitHub expressions that were already substituted
           curl -X POST "${{ inputs.callback_url }}" \
             -H "Content-Type: application/json" \
             -H "X-SBA-Token: ${{ inputs.callback_token }}" \
@@ -209,6 +209,6 @@ jobs:
           curl -X POST "${{ inputs.callback_url }}" \
             -H "Content-Type: application/json" \
             -H "X-SBA-Token: ${{ inputs.callback_token }}" \
-            -d '{"package_name":"${{ inputs.package_name }}","package_version":"${{ inputs.package_version }}","status":"failed","error":"Build or release failed — check Actions logs"}' \
+            -d '{"stage":"build","package_name":"${{ inputs.package_name }}","package_version":"${{ inputs.package_version }}","status":"failed","error":"Build or release failed — check Actions logs"}' \
             --fail --silent --show-error \
             --max-time 30 || true
